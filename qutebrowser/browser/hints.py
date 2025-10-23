@@ -13,6 +13,7 @@ import enum
 import dataclasses
 import json
 import textwrap
+import uuid
 from pathlib import Path, PurePosixPath
 from string import ascii_lowercase
 from typing import (TYPE_CHECKING, Optional)
@@ -45,6 +46,9 @@ from qutebrowser.utils import (
 )
 if TYPE_CHECKING:
     from qutebrowser.browser import browsertab
+
+
+_HINT_JS_ATTR = 'data-qutebrowser-hint-target'
 
 
 class Target(enum.Enum):
@@ -359,6 +363,7 @@ class HintActions:
 
         args_literal = json.dumps(extra_args)
         script_literal = json.dumps(script_source)
+        marker_value = uuid.uuid4().hex
 
         # Import backends lazily to avoid hard dependencies at import time.
         webengine_elem_cls = None
@@ -377,25 +382,31 @@ class HintActions:
         else:
             webkit_elem_cls = webkitelem.WebKitElement
 
-        if webengine_elem_cls is not None and isinstance(elem, webengine_elem_cls):
-            elem_id = getattr(elem, '_id', None)
-            if elem_id is None:
-                raise HintingError("Could not resolve element for javascript hint.")
-            element_expr = (
-                f"(window._qutebrowser && window._qutebrowser.webelem && "
-                f"window._qutebrowser.webelem.get({elem_id}))"
-            )
-            js_code = self._assemble_js_injection(
-                element_expr=element_expr,
-                args_literal=args_literal,
-                script_literal=script_literal,
-            )
+        from qutebrowser.browser import browsertab
 
-            from qutebrowser.browser import browsertab
+        js_code = self._assemble_js_injection(
+            marker_value=marker_value,
+            args_literal=args_literal,
+            script_literal=script_literal,
+        )
 
+        def execute_script() -> None:
             try:
                 context.tab.run_js_async(js_code, world=usertypes.JsWorld.main)
             except browsertab.WebTabError as e:
+                raise HintingError(str(e))
+
+        if webengine_elem_cls is not None and isinstance(elem, webengine_elem_cls):
+            def _callback(_result: object = None) -> None:
+                try:
+                    execute_script()
+                except HintingError as exc:
+                    message.error(str(exc))
+
+            try:
+                elem._js_call('set_attribute', _HINT_JS_ATTR, marker_value,
+                              callback=_callback)
+            except webelem.Error as e:
                 raise HintingError(str(e))
             return
 
@@ -403,15 +414,8 @@ class HintActions:
             qweb_elem = getattr(elem, '_elem', None)
             if qweb_elem is None:
                 raise HintingError("Could not resolve element handle for javascript hint.")
-
-            code = textwrap.dedent("""
-                (function(element) {{
-                    const args = {args_literal};
-                    const fn = new Function('element', 'args', {script_literal});
-                    return fn(element, args);
-                }})(this);
-            """).format(args_literal=args_literal, script_literal=script_literal)
-            qweb_elem.evaluateJavaScript(code)
+            qweb_elem.setAttribute(_HINT_JS_ATTR, marker_value)
+            execute_script()
             return
 
         raise HintingError("Javascript hints are not supported by the current backend.")
@@ -440,24 +444,36 @@ class HintActions:
         )
 
     @staticmethod
-    def _assemble_js_injection(*, element_expr: str,
+    def _assemble_js_injection(*, marker_value: str,
                                args_literal: str,
                                script_literal: str) -> str:
         """Wrap script execution so the hinted element is available."""
         template = """
             (function() {{
-                const element = {element_expr};
+                const selector = '[{attr_name}="' + {marker_value_literal} + '"]';
+                const element = document.querySelector(selector);
                 if (!element) {{
                     console.warn('hint javascript: unable to resolve element');
                     return;
                 }}
+                try {{
+                    element.removeAttribute('{attr_name}');
+                }} catch (error) {{
+                    console.warn('hint javascript: cleanup failed', error);
+                }}
                 const args = {args_literal};
                 const fn = new Function('element', 'args', {script_literal});
-                return fn(element, args);
+                try {{
+                    return fn(element, args);
+                }} catch (error) {{
+                    console.error('hint javascript: script error', error);
+                    throw error;
+                }}
             }})();
         """
         return textwrap.dedent(template).format(
-            element_expr=element_expr,
+            attr_name=_HINT_JS_ATTR,
+            marker_value_literal=json.dumps(marker_value),
             args_literal=args_literal,
             script_literal=script_literal,
         )
