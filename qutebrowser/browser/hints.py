@@ -11,6 +11,10 @@ import re
 import html
 import enum
 import dataclasses
+import json
+import posixpath
+import textwrap
+from pathlib import PurePosixPath
 from string import ascii_lowercase
 from typing import (TYPE_CHECKING, Optional)
 from collections.abc import (
@@ -30,7 +34,16 @@ from qutebrowser.keyinput import modeman, modeparsers, basekeyparser
 from qutebrowser.browser import webelem, history
 from qutebrowser.commands import runners
 from qutebrowser.api import cmdutils
-from qutebrowser.utils import usertypes, log, qtutils, message, objreg, utils, urlutils
+from qutebrowser.utils import (
+    usertypes,
+    log,
+    qtutils,
+    message,
+    objreg,
+    utils,
+    urlutils,
+    resources,
+)
 if TYPE_CHECKING:
     from qutebrowser.browser import browsertab
 
@@ -52,6 +65,7 @@ class Target(enum.Enum):
     hover = enum.auto()
     download = enum.auto()
     userscript = enum.auto()
+    javascript = enum.auto()
     spawn = enum.auto()
     delete = enum.auto()
     right_click = enum.auto()
@@ -331,6 +345,113 @@ class HintActions:
         except userscripts.Error as e:
             raise HintingError(str(e))
 
+    def call_javascript(self, elem: webelem.AbstractWebElement,
+                         context: HintContext) -> None:
+        """Execute a packaged javascript snippet with the hinted element."""
+        script_name = context.args[0]
+        extra_args = context.args[1:]
+        resource_name = self._script_resource(script_name)
+
+        try:
+            script_source = resources.read_file(resource_name)
+        except FileNotFoundError as e:
+            raise HintingError(
+                f"JavaScript file '{script_name}' not found in qutebrowser/js"
+            ) from e
+
+        args_literal = json.dumps(extra_args)
+        script_literal = json.dumps(script_source)
+
+        # Import backends lazily to avoid hard dependencies at import time.
+        webengine_elem_cls = None
+        try:  # pragma: no cover - optional backend
+            from qutebrowser.browser.webengine import webengineelem
+        except ImportError:
+            webengine_elem_cls = None
+        else:
+            webengine_elem_cls = webengineelem.WebEngineElement
+
+        webkit_elem_cls = None
+        try:  # pragma: no cover - optional backend
+            from qutebrowser.browser.webkit import webkitelem
+        except ImportError:
+            webkit_elem_cls = None
+        else:
+            webkit_elem_cls = webkitelem.WebKitElement
+
+        if webengine_elem_cls is not None and isinstance(elem, webengine_elem_cls):
+            elem_id = getattr(elem, '_id', None)
+            if elem_id is None:
+                raise HintingError("Could not resolve element for javascript hint.")
+            element_expr = (
+                f"(window._qutebrowser && window._qutebrowser.webelem && "
+                f"window._qutebrowser.webelem.get({elem_id}))"
+            )
+            js_code = self._assemble_js_injection(
+                element_expr=element_expr,
+                args_literal=args_literal,
+                script_literal=script_literal,
+            )
+
+            from qutebrowser.browser import browsertab
+
+            try:
+                context.tab.run_js_async(js_code, world=usertypes.JsWorld.main)
+            except browsertab.WebTabError as e:
+                raise HintingError(str(e))
+            return
+
+        if webkit_elem_cls is not None and isinstance(elem, webkit_elem_cls):
+            qweb_elem = getattr(elem, '_elem', None)
+            if qweb_elem is None:
+                raise HintingError("Could not resolve element handle for javascript hint.")
+
+            code = textwrap.dedent("""
+                (function(element) {{
+                    const args = {args_literal};
+                    const fn = new Function('element', 'args', {script_literal});
+                    return fn(element, args);
+                }})(this);
+            """).format(args_literal=args_literal, script_literal=script_literal)
+            qweb_elem.evaluateJavaScript(code)
+            return
+
+        raise HintingError("Javascript hints are not supported by the current backend.")
+
+    @staticmethod
+    def _script_resource(script_name: str) -> str:
+        """Validate and convert a filename to a resource path."""
+        normalized = script_name.replace('\\', '/')
+        path = PurePosixPath(normalized)
+        if not normalized or path.is_absolute() or '..' in path.parts:
+            raise HintingError(
+                f"Invalid javascript filename '{script_name}'. Use paths inside qutebrowser/js."
+            )
+        return posixpath.join('js', path.as_posix())
+
+    @staticmethod
+    def _assemble_js_injection(*, element_expr: str,
+                               args_literal: str,
+                               script_literal: str) -> str:
+        """Wrap script execution so the hinted element is available."""
+        template = """
+            (function() {{
+                const element = {element_expr};
+                if (!element) {{
+                    console.warn('hint javascript: unable to resolve element');
+                    return;
+                }}
+                const args = {args_literal};
+                const fn = new Function('element', 'args', {script_literal});
+                return fn(element, args);
+            }})();
+        """
+        return textwrap.dedent(template).format(
+            element_expr=element_expr,
+            args_literal=args_literal,
+            script_literal=script_literal,
+        )
+
     def delete(self, elem: webelem.AbstractWebElement,
                _context: HintContext) -> None:
         elem.delete()
@@ -384,6 +505,7 @@ class HintManager(QObject):
         Target.right_click: "Right-click hint",
         Target.download: "Download hint",
         Target.userscript: "Call userscript via hint",
+        Target.javascript: "Run javascript via hint",
         Target.spawn: "Spawn command via hint",
         Target.delete: "Delete an element",
     }
@@ -575,17 +697,18 @@ class HintManager(QObject):
         """
         if not isinstance(target, Target):
             raise TypeError("Target {} is no Target member!".format(target))
-        if target in [Target.userscript, Target.spawn, Target.run,
-                      Target.fill]:
+        if target in [Target.userscript, Target.javascript, Target.spawn,
+                      Target.run, Target.fill]:
             if not args:
                 raise cmdutils.CommandError(
-                    "'args' is required with target userscript/spawn/run/"
-                    "fill.")
+                    "'args' is required with target javascript/userscript/"
+                    "spawn/run/fill.")
         else:
             # pylint: disable=else-if-used
             if args:
                 raise cmdutils.CommandError(
-                    "'args' is only allowed with target userscript/spawn.")
+                    "'args' is only allowed with target javascript/userscript"
+                    "/spawn.")
 
     def _filter_matches(self, filterstr: Optional[str], elemstr: str) -> bool:
         """Return True if `filterstr` matches `elemstr`."""
@@ -706,6 +829,8 @@ class HintManager(QObject):
                 - `download`: Download the link.
                 - `userscript`: Call a userscript with `$QUTE_URL` set to the
                                 link.
+                - `javascript`: Execute a JavaScript module from
+                               `qutebrowser/js` with the hinted element.
                 - `spawn`: Spawn a command.
                 - `delete`: Delete the selected element.
 
@@ -726,6 +851,10 @@ class HintManager(QObject):
                                      `~/.local/share/qutebrowser/userscripts`
                                      (or `$XDG_DATA_HOME`), or use an absolute
                                      path.
+                - With `javascript`: The script filename inside
+                                      `qutebrowser/js`, optionally followed by
+                                      additional arguments accessible as
+                                      `args` within the script.
                 - With `fill`: The command to fill the statusbar with.
                                 `{hint-url}` will get replaced by the selected
                                 URL.
@@ -945,6 +1074,7 @@ class HintManager(QObject):
             # _download needs a QWebElement to get the frame.
             Target.download: self._actions.download,
             Target.userscript: self._actions.call_userscript,
+            Target.javascript: self._actions.call_javascript,
             Target.delete: self._actions.delete,
         }
         # Handlers which take a QUrl

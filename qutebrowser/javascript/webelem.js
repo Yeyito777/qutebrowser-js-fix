@@ -413,5 +413,16 @@ window._qutebrowser.webelem = (function() {
         elem.remove();
     };
 
+    funcs.get = (id) => {
+        if (id === null || id === undefined) {
+            return null;
+        }
+        const index = Number(id);
+        if (!Number.isInteger(index) || index < 0) {
+            return null;
+        }
+        return elements[index] || null;
+    };
+
     return funcs;
 })();

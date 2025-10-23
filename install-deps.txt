@@ -1,0 +1,5 @@
+# Uninstall these with pacman -Rns to debloat
+
+python-pyqt5
+python-pyqtwebengine
+python-pygments
