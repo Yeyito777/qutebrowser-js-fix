@@ -444,17 +444,16 @@ class HintActions:
         )
 
     @staticmethod
-    @staticmethod
     def _indent_script(script: str) -> str:
-        """Indent and escape a script body for injection formatting."""
-        if not script:
-            return ' ' * 16 + '// (empty script)'
+        """Indent a script body for injection formatting."""
+        indentation = ' ' * 16
+        if not script.strip():
+            return indentation + '// (empty hint javascript)\n'
 
-        escaped = script.replace('{', '{{').replace('}', '}}')
-        indentation = ' ' * 20
-        lines = escaped.splitlines()
-        indented = '\n'.join(indentation + line for line in lines)
-        return indented
+        stripped = script.rstrip('\n')
+        indented = textwrap.indent(stripped, indentation,
+                                   lambda _line: True)
+        return indented + '\n'
 
     @staticmethod
     def _assemble_js_injection(*, marker_value: str,
@@ -477,7 +476,7 @@ class HintActions:
                 const args = {args_literal};
                 try {{
                     (function(element, args) {{
-{script_block}
+__SCRIPT_BLOCK__
                     }})(element, args);
                 }} catch (error) {{
                     console.error('hint javascript: script error', error);
@@ -486,12 +485,12 @@ class HintActions:
                 return undefined;
             }})();
         """
-        return textwrap.dedent(template).format(
+        formatted = textwrap.dedent(template).format(
             attr_name=_HINT_JS_ATTR,
             marker_value_literal=json.dumps(marker_value),
             args_literal=args_literal,
-            script_block=script_block,
         )
+        return formatted.replace('__SCRIPT_BLOCK__', script_block)
 
     def delete(self, elem: webelem.AbstractWebElement,
                _context: HintContext) -> None:
