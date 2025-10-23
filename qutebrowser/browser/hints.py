@@ -362,7 +362,7 @@ class HintActions:
             raise HintingError(str(e))
 
         args_literal = json.dumps(extra_args)
-        script_literal = json.dumps(script_source)
+        script_block = self._indent_script(script_source)
         marker_value = uuid.uuid4().hex
 
         # Import backends lazily to avoid hard dependencies at import time.
@@ -387,7 +387,7 @@ class HintActions:
         js_code = self._assemble_js_injection(
             marker_value=marker_value,
             args_literal=args_literal,
-            script_literal=script_literal,
+            script_block=script_block,
         )
 
         def execute_script() -> None:
@@ -444,9 +444,22 @@ class HintActions:
         )
 
     @staticmethod
+    @staticmethod
+    def _indent_script(script: str) -> str:
+        """Indent and escape a script body for injection formatting."""
+        if not script:
+            return ' ' * 16 + '// (empty script)'
+
+        escaped = script.replace('{', '{{').replace('}', '}}')
+        indentation = ' ' * 20
+        lines = escaped.splitlines()
+        indented = '\n'.join(indentation + line for line in lines)
+        return indented
+
+    @staticmethod
     def _assemble_js_injection(*, marker_value: str,
                                args_literal: str,
-                               script_literal: str) -> str:
+                               script_block: str) -> str:
         """Wrap script execution so the hinted element is available."""
         template = """
             (function() {{
@@ -462,20 +475,22 @@ class HintActions:
                     console.warn('hint javascript: cleanup failed', error);
                 }}
                 const args = {args_literal};
-                const fn = new Function('element', 'args', {script_literal});
                 try {{
-                    return fn(element, args);
+                    (function(element, args) {{
+{script_block}
+                    }})(element, args);
                 }} catch (error) {{
                     console.error('hint javascript: script error', error);
                     throw error;
                 }}
+                return undefined;
             }})();
         """
         return textwrap.dedent(template).format(
             attr_name=_HINT_JS_ATTR,
             marker_value_literal=json.dumps(marker_value),
             args_literal=args_literal,
-            script_literal=script_literal,
+            script_block=script_block,
         )
 
     def delete(self, elem: webelem.AbstractWebElement,
