@@ -12,9 +12,8 @@ import html
 import enum
 import dataclasses
 import json
-import posixpath
 import textwrap
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from string import ascii_lowercase
 from typing import (TYPE_CHECKING, Optional)
 from collections.abc import (
@@ -42,7 +41,7 @@ from qutebrowser.utils import (
     objreg,
     utils,
     urlutils,
-    resources,
+    standarddir,
 )
 if TYPE_CHECKING:
     from qutebrowser.browser import browsertab
@@ -350,14 +349,13 @@ class HintActions:
         """Execute a packaged javascript snippet with the hinted element."""
         script_name = context.args[0]
         extra_args = context.args[1:]
-        resource_name = self._script_resource(script_name)
+        script_path = self._script_path(script_name)
 
         try:
-            script_source = resources.read_file(resource_name)
-        except FileNotFoundError as e:
-            raise HintingError(
-                f"JavaScript file '{script_name}' not found in qutebrowser/js"
-            ) from e
+            with open(script_path, encoding='utf-8') as file:
+                script_source = file.read()
+        except OSError as e:
+            raise HintingError(str(e))
 
         args_literal = json.dumps(extra_args)
         script_literal = json.dumps(script_source)
@@ -419,15 +417,27 @@ class HintActions:
         raise HintingError("Javascript hints are not supported by the current backend.")
 
     @staticmethod
-    def _script_resource(script_name: str) -> str:
-        """Validate and convert a filename to a resource path."""
+    def _script_path(script_name: str) -> str:
+        """Resolve a javascript filename inside the configured hint directories."""
         normalized = script_name.replace('\\', '/')
         path = PurePosixPath(normalized)
         if not normalized or path.is_absolute() or '..' in path.parts:
             raise HintingError(
-                f"Invalid javascript filename '{script_name}'. Use paths inside qutebrowser/js."
+                f"Invalid javascript filename '{script_name}'. Use paths inside the js directory."
             )
-        return posixpath.join('js', path.as_posix())
+        search_dirs = [
+            Path(standarddir.config()) / 'js',
+            Path(standarddir.data()) / 'js',
+        ]
+        for base in search_dirs:
+            candidate = base.joinpath(*path.parts)
+            if candidate.is_file():
+                return str(candidate)
+
+        pretty_dirs = ', '.join(str(directory) for directory in search_dirs)
+        raise HintingError(
+            f"JavaScript file '{script_name}' not found in hint script directories: {pretty_dirs}"
+        )
 
     @staticmethod
     def _assemble_js_injection(*, element_expr: str,
@@ -829,8 +839,9 @@ class HintManager(QObject):
                 - `download`: Download the link.
                 - `userscript`: Call a userscript with `$QUTE_URL` set to the
                                 link.
-                - `javascript`: Execute a JavaScript module from
-                               `qutebrowser/js` with the hinted element.
+                - `javascript`: Execute a JavaScript file from the
+                               `js` subdirectory of the user config/data
+                               directories with the hinted element.
                 - `spawn`: Spawn a command.
                 - `delete`: Delete the selected element.
 
@@ -851,8 +862,9 @@ class HintManager(QObject):
                                      `~/.local/share/qutebrowser/userscripts`
                                      (or `$XDG_DATA_HOME`), or use an absolute
                                      path.
-                - With `javascript`: The script filename inside
-                                      `qutebrowser/js`, optionally followed by
+                - With `javascript`: The script filename inside the `js`
+                                      subdirectory of the config/data
+                                      directories, optionally followed by
                                       additional arguments accessible as
                                       `args` within the script.
                 - With `fill`: The command to fill the statusbar with.
